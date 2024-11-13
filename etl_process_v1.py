@@ -1,22 +1,19 @@
 import json
-import pandas as pd
-from datetime import datetime
 import logging
-import os
+from datetime import datetime
 from snowflake.snowpark import Session
-from snowflake.snowpark import types
-import numpy as np
+import pandas as pd
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SNOWFLAKE_ACCOUNT = 'snowflake'
+SNOWFLAKE_ACCOUNT = 'dev'
 SNOWFLAKE_USER = 'DEV'
 SNOWFLAKE_PASSWORD = 'abcd'
-SNOWFLAKE_DATABASE = 'DEV_DB'  # Snowflake database name
-SNOWFLAKE_SCHEMA = 'RAW_STAGE'  # Snowflake schema name
-SNOWFLAKE_WAREHOUSE = 'NABLE_DEV_WH'
+SNOWFLAKE_DATABASE = 'DEV_RAW_DB'  
+SNOWFLAKE_SCHEMA = 'RAW_STAGE'  
+SNOWFLAKE_WAREHOUSE = 'DEV_WH'
 
 # Create a dictionary for the connection options
 connection_parameters = {
@@ -40,21 +37,20 @@ class SimpleSnowflakeETL:
     def setup_tables(self):
         """Create required tables if they don't exist"""
         logger.info("Setting up tables if they don't exist...")
-        
-        # Create main tables with details as VARIANT to store semi-structured data
+
         logger.info(self.session.sql("""
-            CREATE OR REPLACE TABLE dev_raw_db.raw_stage.products (
+            CREATE TABLE IF NOT EXISTS dev_raw_db.raw_stage.products (
                 manufacturer STRING,
                 sku STRING,
                 category STRING,
                 title STRING,
-                details STRING,  -- Store semi-structured data here
+                details STRING,
                 updated_on TIMESTAMP_NTZ
             )
         """).collect())
 
         logger.info(self.session.sql("""
-            CREATE OR REPLACE TABLE dev_raw_db.raw_stage.prices (
+            CREATE TABLE IF NOT EXISTS dev_raw_db.raw_stage.prices (
                 manufacturer STRING,
                 sku STRING,
                 price FLOAT,
@@ -67,84 +63,54 @@ class SimpleSnowflakeETL:
     def load_products(self, json_file):
         """Load product data from JSON file"""
         logger.info(f"Processing file: {json_file}")
-        
+
         try:
-            # Read and validate products
+            # Read JSON data
             with open(json_file, 'r') as f:
                 products = json.load(f)
             
-            # Transform products into DataFrame
-            product_data = []
-            for p in products:
-                if all(k in p for k in ['Manufacturer', 'SKU', 'Category', 'Title', 'Details', 'UpdatedOnUTC']):
-                    product_data.append({
-                        'manufacturer': str(p['Manufacturer']),
-                        'sku': str(p['SKU']),
-                        'category': str(p['Category']),
-                        'title': str(p['Title']),
-                        # Directly store details as a dictionary (semi-structured data)
-                        'details': json.dumps(p['Details']),  # No json.dumps here
-                        # Convert UpdatedOnUTC to datetime object and then to string for Snowflake compatibility
-                        'updated_on': datetime.fromisoformat(p['UpdatedOnUTC'].replace('Z', '+00:00'))
-                    })
-                else:
-                    logger.warning(f"Skipping invalid product: {p}")
-            
-            # Log a preview of the DataFrame for debugging
-            if product_data:
-                df = pd.DataFrame(product_data)
-                df['updated_on'] = pd.to_datetime(df['updated_on']).astype(str)
-                df['details'] = df['details'].astype(str)
-                #logger.info(f"DataFrame head: {df.head()}")
+            # Prepare records for Snowflake directly
+            records = [
+                {
+                    'manufacturer': str(p['Manufacturer']),
+                    'sku': str(p['SKU']),
+                    'category': str(p['Category']),
+                    'title': str(p['Title']),
+                    'details': json.dumps(p['Details']),
+                    'updated_on': datetime.fromisoformat(p['UpdatedOnUTC'].replace('Z', '+00:00'))
+                }
+                for p in products if all(k in p for k in ['Manufacturer', 'SKU', 'Category', 'Title', 'Details', 'UpdatedOnUTC'])
+            ]
 
-                # Convert pandas DataFrame to Snowpark DataFrame
-                records = df.to_dict(orient='records')
-                #print(records)
-                snowflake_df = session.create_dataframe(records)
-
-                try:
-                    snowflake_df.write.mode('append').saveAsTable('dev_raw_db.raw_stage.products')
-                    logger.info(f"Data staged successfully into: dev_raw_db.raw_stage.products.")
-                except Exception as e:
-                    logger.error(f"Failed definition load with exception: {e}")
-                    raise Exception(f"An error occurred while loading data into dev_raw_db.raw_stage.products Snowflake table:", str(e))
+            if records:
+                snowflake_df = self.session.create_dataframe(records)
+                snowflake_df.write.mode('append').saveAsTable('dev_raw_db.raw_stage.products')
+                logger.info("Data staged successfully into: dev_raw_db.raw_stage.products.")
+            else:
+                logger.warning("No valid product records found to load.")
 
         except Exception as e:
             logger.error(f"Error loading products: {str(e)}")
             raise
 
-
     def load_prices(self, csv_file, distributor):
         """Load price data from CSV file"""
         logger.info(f"Processing prices from {distributor}: {csv_file}")
-        
-        try:
-            # Read CSV directly into DataFrame
-            df = pd.read_csv(csv_file, quotechar='"')
-            
-            # Add distributor and timestamp
-            df['distributor'] = distributor
-            df['updated_on'] = datetime.now()
-            df['updated_on'] = df['updated_on'].astype(str)
-            df['SKU'] = df['SKU'].astype(str)
-            df['Manufacturer'] = df['Manufacturer'].astype(str)
-            df['distributor'] = df['distributor'].astype(str)
-            
-            # Rename columns to match Snowflake
-            df.columns = [col.lower() for col in df.columns]
-            
-            # Convert pandas DataFrame to Snowpark DataFrame
-            records = df.to_dict(orient='records')
-            snowflake_df = session.create_dataframe(records)
 
-            try:
+        try:
+            # Read CSV and prepare records
+            df = pd.read_csv(csv_file, header=0, quotechar='"')
+            df["distributor"] = distributor
+            df["updated_on"] =  str(datetime.now())
+
+            if df.shape[0] > 0:
+                # Write the data directly to Snowflake
+                snowflake_df = self.session.create_dataframe(df)
                 snowflake_df.write.mode('append').saveAsTable('dev_raw_db.raw_stage.prices')
                 logger.info(f"Data staged successfully into: dev_raw_db.raw_stage.prices.")
-            except Exception as e:
-                logger.error(f"Failed definition load with exception: {e}")
-                raise Exception(f"An error occurred while loading data into dev_raw_db.raw_stage.prices Snowflake table:", str(e))
+            else:
+                logger.warning("No valid price records found to load.")
 
-            
         except Exception as e:
             logger.error(f"Error loading prices: {str(e)}")
             raise
@@ -154,52 +120,33 @@ class SimpleSnowflakeETL:
         try:
             # Collecting all statistics for the summary report
             stats = {
-                # Number of Unique Product Records
                 'unique_product_records': self.session.sql("SELECT COUNT(DISTINCT sku) FROM dev_raw_db.raw_stage.products").collect()[0][0],
-                
-                # Number of Unique Manufacturers
                 'unique_manufacturers': self.session.sql("SELECT COUNT(DISTINCT manufacturer) FROM dev_raw_db.raw_stage.products").collect()[0][0],
-                
-                # Number of Unique Categories
                 'unique_categories': self.session.sql("SELECT COUNT(DISTINCT category) FROM dev_raw_db.raw_stage.products").collect()[0][0],
-                
-                # Number of Unique Price Records (unique by sku and distributor)
                 'unique_price_records': self.session.sql("SELECT COUNT(DISTINCT sku, distributor) FROM dev_raw_db.raw_stage.prices").collect()[0][0],
-                
-                # Number of Unique Distributors
                 'unique_distributors': self.session.sql("SELECT COUNT(DISTINCT distributor) FROM dev_raw_db.raw_stage.prices").collect()[0][0],
-                
-                # Number of Product Records per Category
                 'product_records_per_category': self.session.sql("""
                     SELECT category, COUNT(sku) AS product_count
                     FROM dev_raw_db.raw_stage.products
                     GROUP BY category
                 """).collect(),
-
-                # Number of Price Records per Distributor
                 'price_records_per_distributor': self.session.sql("""
                     SELECT distributor, COUNT(DISTINCT sku) AS price_count
                     FROM dev_raw_db.raw_stage.prices
                     GROUP BY distributor
                 """).collect(),
-
-                # Number of Product Records per Manufacturer
                 'product_records_per_manufacturer': self.session.sql("""
                     SELECT manufacturer, COUNT(sku) AS product_count
                     FROM dev_raw_db.raw_stage.products
                     GROUP BY manufacturer
                 """).collect()
-            
-
             }
 
-            # Returning the collected stats (You may format this further before returning as a PDF)
             return stats
 
         except Exception as e:
             logger.error(f"Error generating report: {str(e)}")
             raise
-
 
 def main():
     try:
