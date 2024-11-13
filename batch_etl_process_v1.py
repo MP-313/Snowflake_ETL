@@ -101,11 +101,16 @@ class SimpleSnowflakeETL:
             # Read CSV and prepare records
             df = pd.read_csv(csv_file, header=0, quotechar='"')
             df["distributor"] = distributor
-            df["updated_on"] =  str(datetime.now())
+            df["updated_on"] = datetime.now()
+
+            # Convert pandas data  types to be compatible with snowflake
+            for col in df.columns:
+                if df[col].dtype == 'object' or pd.api.types.is_datetime64_any_dtype(df[col]):  # Check if the column is of object type
+                    df[col] = df[col].astype(str)
 
             if df.shape[0] > 0:
                 # Write the data directly to Snowflake
-                snowflake_df = self.session.create_dataframe(df)
+                snowflake_df = self.session.create_dataframe(df.to_dict(orient="records"))
                 snowflake_df.write.mode('append').saveAsTable('dev_raw_db.raw_stage.prices')
                 logger.info(f"Data staged successfully into: dev_raw_db.raw_stage.prices.")
             else:
@@ -150,7 +155,6 @@ class SimpleSnowflakeETL:
 
 def main():
     try:
-        # Create ETL pipeline
         etl = SimpleSnowflakeETL(session)
         
         # Load product data
@@ -165,7 +169,7 @@ def main():
         logger.info("Summary Report:")
         logger.info(json.dumps(report, indent=2))
         
-        # Write report to a text file
+        # Write report to a summary_report file
         with open('summary_report.txt', 'w') as f:
             f.write(json.dumps(report, indent=2))
         logger.info("Report written to summary_report.txt")
